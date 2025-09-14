@@ -761,13 +761,15 @@ class AnchorFusionNet(nn.Module):
         if not skip_noise_inject:
             noise_add, noise_gate = self.noise_inject(decoded, warped_avg)
         else:
-            noise_add, noise_gate = torch.zeros_like(decoded), torch.zeros_like(decoded)
+            noise_add = torch.zeros_like(synthesized)  # Ensure same size as synthesized
+            noise_gate = torch.zeros_like(synthesized)  # Same for noise_gate
 
         # Optional content skip
         if not skip_content_skip:
             prior_mix, content_gate = self.content_skip(decoded, warped_avg)
         else:
-            prior_mix, content_gate = torch.zeros_like(decoded), torch.zeros_like(decoded)
+            prior_mix = torch.zeros_like(synthesized)  # Ensure same size as synthesized
+            content_gate = torch.zeros_like(synthesized)  # Same for noise_gate
 
         # Final output
         out = synthesized + residual + noise_add

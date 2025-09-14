@@ -821,7 +821,7 @@ ImprovedHierarchicalCrossAttentionFusion = PyramidCrossAttention
 EnhancedMultiAnchorFusionModel = AnchorFusionNet
 TemporalWeightingModule = TemporalWeightingMLP
 EnhancedResidualBlock = DetailAwareResBlock
-create_enhanced_fusion_model = build_fusion_net
+create_fusion_model = build_fusion_net
 
 
 # -------------------------

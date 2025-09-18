@@ -134,6 +134,8 @@ class ConvBlock(nn.Module):
             self.activation = nn.Tanh()
         elif activation == 'sigmoid':
             self.activation = nn.Sigmoid()
+        elif activation == 'silu':
+            self.activation = nn.SiLU(inplace=True)
 
     def forward(self, x):
         x = self.conv(x)
@@ -168,6 +170,219 @@ class DetailAwareResBlock(nn.Module):
             y = self.dpa(y, low, high)
         y = y + r * self.residual_weight
         return self.activation(y)
+    
+# -------------------------
+# Temporal Guidance Modules
+# -------------------------
+
+class TemporalPositionEncoding(nn.Module):
+    """
+    Encodes temporal position (timestep) information using sinusoidal embeddings
+    and learnable projections to guide interpolation.
+    """
+    def __init__(self, channels, max_freq=10):
+        super().__init__()
+        self.channels = channels
+        self.max_freq = max_freq
+        
+        # Create sinusoidal frequency bases
+        freq_bands = 2.0 ** torch.linspace(0, max_freq - 1, max_freq)
+        self.register_buffer('freq_bands', freq_bands)
+        
+        # Learnable projection to map encoded timesteps to channel dimension
+        self.time_proj = nn.Sequential(
+            nn.Linear(max_freq * 2, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels)
+        )
+    
+    def forward(self, timesteps):
+        """
+        timesteps: [B, N] values in [0, 1] indicating position between frames
+        Returns: [B, N, C] temporal encodings
+        """
+        B, N = timesteps.shape
+        
+        # Expand timesteps for frequency encoding
+        t = timesteps.unsqueeze(-1)  # [B, N, 1]
+        
+        # Apply sinusoidal encoding
+        freq_features = []
+        for freq in self.freq_bands:
+            freq_features.append(torch.sin(2 * math.pi * freq * t))
+            freq_features.append(torch.cos(2 * math.pi * freq * t))
+        
+        encoded = torch.cat(freq_features, dim=-1)  # [B, N, max_freq*2]
+        
+        # Project to channel dimension
+        return self.time_proj(encoded)  # [B, N, C]
+
+
+class TemporalGuidanceModule(nn.Module):
+    """
+    Injects temporal guidance into features based on timestep position.
+    Uses both additive and multiplicative modulation.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        
+        # Temporal encoding
+        self.time_encoder = TemporalPositionEncoding(channels)
+        
+        # Generate scale and shift parameters from temporal encoding
+        self.scale_net = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+            nn.Sigmoid()  # Scale between 0 and 1
+        )
+        
+        self.shift_net = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+            nn.Tanh()  # Shift between -1 and 1
+        )
+        
+        # Learnable balance between scale and shift
+        self.scale_weight = nn.Parameter(torch.tensor(1.0))
+        self.shift_weight = nn.Parameter(torch.tensor(0.1))
+    
+    def forward(self, features, timesteps):
+        """
+        features: [B, C, H, W] or [B, N, C, H, W]
+        timesteps: [B, N] temporal positions
+        Returns: temporally modulated features
+        """
+        # Encode temporal positions
+        time_emb = self.time_encoder(timesteps)  # [B, N, C]
+        
+        if features.dim() == 4:  # Single feature [B, C, H, W]
+            # Average over anchors for single feature case
+            time_emb = time_emb.mean(dim=1)  # [B, C]
+            scale = self.scale_net(time_emb).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+            shift = self.shift_net(time_emb).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+            
+            return features * (1 + scale * self.scale_weight) + shift * self.shift_weight
+        
+        else:  # Multiple features [B, N, C, H, W]
+            B, N, C, H, W = features.shape
+            modulated = []
+            
+            for i in range(N):
+                feat = features[:, i]  # [B, C, H, W]
+                t_emb = time_emb[:, i]  # [B, C]
+                
+                scale = self.scale_net(t_emb).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+                shift = self.shift_net(t_emb).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+                
+                mod_feat = feat * (1 + scale * self.scale_weight) + shift * self.shift_weight
+                modulated.append(mod_feat)
+            
+            return torch.stack(modulated, dim=1)
+
+
+class TemporalWeightingMLP(nn.Module):
+    """
+    Enhanced temporal weighting that considers timestep positions to predict
+    interpolation weights rather than just processing them directly.
+    """
+    def __init__(self, num_anchors=3, hidden_dim=128, use_position_guidance=True):
+        super().__init__()
+        self.use_position_guidance = use_position_guidance
+        
+        if use_position_guidance:
+            # Encode temporal positions first
+            self.time_encoder = TemporalPositionEncoding(hidden_dim // 2)
+            
+            # Process encoded positions to predict weights
+            self.net = nn.Sequential(
+                nn.Linear(hidden_dim // 2, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, num_anchors),
+                nn.Softmax(dim=1)
+            )
+        else:
+            # Original implementation
+            self.net = nn.Sequential(
+                nn.Linear(num_anchors, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, num_anchors),
+                nn.Softmax(dim=1)
+            )
+    
+    def forward(self, timesteps):
+        if self.use_position_guidance:
+            # Encode timesteps and process to get weights
+            encoded = self.time_encoder(timesteps)  # [B, N, hidden_dim//2]
+            encoded = encoded.mean(dim=1)  # [B, hidden_dim//2]
+            return self.net(encoded)
+        else:
+            return self.net(timesteps)
+
+
+class TemporalFlowModulation(nn.Module):
+    """
+    Modulates optical flow based on temporal position.
+    Adjusts flow magnitude and direction based on where we are in time.
+    """
+    def __init__(self, channels=64):
+        super().__init__()
+        
+        self.time_encoder = TemporalPositionEncoding(channels)
+        
+        # Predict flow adjustments
+        self.flow_adjust = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels, 32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Conv for spatial flow adjustment
+        self.flow_conv = nn.Sequential(
+            nn.Conv2d(32, 4, 1),
+            nn.Tanh()
+        )
+        
+        # Learnable scale for adjustments
+        self.adjust_scale = nn.Parameter(torch.tensor(0.1))
+    
+    def forward(self, flow, timesteps):
+        """
+        flow: [B, N, 4, H, W] optical flow
+        timesteps: [B, N] temporal positions
+        Returns: adjusted flow
+        """
+        B, N, _, H, W = flow.shape
+        adjusted_flows = []
+        
+        for i in range(N):
+            t = timesteps[:, i:i+1]  # [B, 1]
+            f = flow[:, i]  # [B, 4, H, W]
+            
+            # Encode temporal position
+            t_emb = self.time_encoder(t)  # [B, 1, C]
+            t_emb = t_emb.squeeze(1)  # [B, C]
+            
+            # Predict flow adjustment
+            adjustment = self.flow_adjust(t_emb)  # [B, 32]
+            adjustment = adjustment.unsqueeze(-1).unsqueeze(-1).expand(B, 32, H, W)
+            adjustment = self.flow_conv(adjustment)  # [B, 4, H, W]
+            
+            # Apply temporal-aware adjustment
+            # Scale adjustment based on distance from endpoints (0 or 1)
+            t_weight = 4 * t[:, 0:1, None, None] * (1 - t[:, 0:1, None, None])  # Peak at t=0.5
+            adjusted_f = f + adjustment * self.adjust_scale * t_weight
+            
+            adjusted_flows.append(adjusted_f)
+        
+        return torch.stack(adjusted_flows, dim=1)
 
 
 # -------------------------
@@ -176,131 +391,141 @@ class DetailAwareResBlock(nn.Module):
 
 class PyramidCrossAttention(nn.Module):
     """
-    Hierarchical cross-anchor attention with frequency-aware queries
-    and a learnable post-upsample refinement.
+    Deformable Pyramid Cross Attention - drop-in replacement for the original.
+    Uses deformable sampling instead of full attention for massive memory savings.
     """
-    def __init__(self, channels, num_heads=4, max_attention_size=64*64):
+    def __init__(self, channels, num_heads=4, max_attention_size=64*64,
+                 num_points=4, num_levels=3, init_spatial_range=0.1):
         super().__init__()
-        self.num_heads = num_heads
         self.channels = channels
-        self.head_dim = channels // max(1, num_heads)
-        self.max_attention_size = max_attention_size
-
+        self.num_heads = num_heads
+        self.num_points = num_points
+        self.num_levels = num_levels
+        self.max_attention_size = max_attention_size  # Kept for compatibility
+        
+        assert channels % num_heads == 0
+        self.head_dim = channels // num_heads
+        
+        # Deformable attention components
+        self.sampling_offsets = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, 1),
+            nn.GroupNorm(min(8, channels // 4), channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 2, num_heads * num_levels * num_points * 2, 1)
+        )
+        
+        self.attention_weights = nn.Sequential(
+            nn.Conv2d(channels, channels // 2, 1),
+            nn.GroupNorm(min(8, channels // 4), channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 2, num_heads * num_levels * num_points, 1)
+        )
+        
+        self.value_proj = nn.Conv2d(channels, channels, 1)
+        self.output_proj = nn.Conv2d(channels, channels, 1)
+        
+        # Frequency decomposition (matching original)
         self.freq_decomp = AdaptiveFrequencyDecoupling(channels)
-
-        # per-scale qkv projections
-        possible_scales = [64, 32, 16, 8, 4, 2]
-        self.attn_modules = nn.ModuleDict()
-        for s in possible_scales:
-            self.attn_modules[str(s)] = nn.ModuleDict({
-                'q': nn.Conv2d(channels, channels, 1),
-                'k': nn.Conv2d(channels, channels, 1),
-                'v': nn.Conv2d(channels, channels, 1),
-            })
-
-        # learned fusers
-        self.fw2 = nn.Parameter(torch.ones(2) / 2)
-        self.fw3 = nn.Parameter(torch.ones(3) / 3)
-        self.fw4 = nn.Parameter(torch.ones(4) / 4)
-        self.fuse2 = nn.Conv2d(channels * 2, channels, 1)
-        self.fuse3 = nn.Conv2d(channels * 3, channels, 1)
-        self.fuse4 = nn.Conv2d(channels * 4, channels, 1)
-
-        # light refinement after upsampling pooled attention outputs
-        self.post_upsample_refine = nn.Conv2d(channels, channels, 3, 1, 1)
-
-        # fallback scale when none selected externally
         self.hf_scale = nn.Parameter(torch.tensor(0.3))
-
-    def _scales_for(self, H, W):
-        area = H * W
-        min_scale = max(2, int(np.sqrt(area / self.max_attention_size)))
-        scales = []
-        if min_scale <= 64:
-            scales.append(min_scale)
-        if min_scale * 2 <= 64:
-            scales.append(min_scale * 2)
-        if min_scale * 4 <= 64 and len(scales) < 3:
-            scales.append(min_scale * 4)
-        if len(scales) < 2:
-            scales = [16, 8] if min_scale < 64 else [64, 32]
-        scales = [s for s in scales[:4] if str(s) in self.attn_modules]
-        if not scales:
-            scales = [16, 8]
-        return sorted(scales, reverse=True)
-
-    def forward(self, query, keys, values, hf_res_scale: torch.Tensor = None):
+        
+        # Level embeddings
+        self.level_embed = nn.Parameter(torch.zeros(num_levels, channels))
+        
+        self._reset_parameters(init_spatial_range)
+    
+    def _reset_parameters(self, init_range):
+        nn.init.constant_(self.sampling_offsets[-1].weight.data, 0.)
+        
+        thetas = torch.arange(self.num_heads, dtype=torch.float32) * (2.0 * math.pi / self.num_heads)
+        grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
+        grid_init = (grid_init / grid_init.abs().max(-1, keepdim=True)[0]) * init_range
+        grid_init = grid_init.view(self.num_heads, 1, 1, 2).repeat(1, self.num_levels, self.num_points, 1)
+        
+        for i in range(self.num_points):
+            grid_init[:, :, i, :] *= (i + 1) / self.num_points
+        
+        for lvl in range(self.num_levels):
+            grid_init[:, lvl, :, :] *= (2 ** lvl) * 0.1
+            
+        with torch.no_grad():
+            self.sampling_offsets[-1].bias.copy_(grid_init.view(-1))
+        
+        nn.init.constant_(self.attention_weights[-1].weight.data, 0.)
+        nn.init.constant_(self.attention_weights[-1].bias.data, 0.)
+        nn.init.normal_(self.level_embed, 0.0, 0.02)
+    
+    def forward(self, query, keys, values, hf_res_scale=None):
         """
-        query: [B,C,H,W]
-        keys, values: [B,N,C,H,W]
+        Exact same interface as original PyramidCrossAttention.
+        query: [B, C, H, W]
+        keys: [B, N, C, H, W] 
+        values: [B, N, C, H, W]
+        hf_res_scale: optional high-freq scale
         """
         B, C, H, W = query.shape
-        N = keys.shape[1]
-
+        N = min(keys.shape[1], self.num_levels)  # Use available levels
+        
+        # Frequency decomposition
         q_low, q_high = self.freq_decomp(query)
-        scales = self._scales_for(H, W)
-        collected = []
-
-        for s in scales:
-            am = self.attn_modules[str(s)]
-            if s > 1:
-                Hs = max(1, H // s)
-                Ws = max(1, W // s)
-
-                q_s = F.adaptive_avg_pool2d(q_low, (Hs, Ws))
-
-                k_in = keys.view(B * N, C, H, W)
-                v_in = values.view(B * N, C, H, W)
-                k_s = F.adaptive_avg_pool2d(k_in, (Hs, Ws)).view(B, N, C, Hs, Ws)
-                v_s = F.adaptive_avg_pool2d(v_in, (Hs, Ws)).view(B, N, C, Hs, Ws)
-            else:
-                q_s, k_s, v_s = query, keys, values
-                Hs, Ws = H, W
-
-            q = am['q'](q_s)
-            heads = self.num_heads if C % self.num_heads == 0 else 1
-            d = C // heads
-            q = q.view(B, heads, d, Hs * Ws).transpose(-2, -1)  # [B,heads,HW,d]^T
-
-            attn_out = []
-            for i in range(N):
-                k = am['k'](k_s[:, i]).view(B, heads, d, Hs * Ws)
-                v = am['v'](v_s[:, i]).view(B, heads, d, Hs * Ws).transpose(-2, -1)
-
-                scores = torch.matmul(q, k) * (d ** -0.5)
-                scores = scores - scores.max(dim=-1, keepdim=True)[0]
-                a = F.softmax(scores, dim=-1)
-                o = torch.matmul(a, v)
-                attn_out.append(o)
-
-            if len(attn_out) > 0:
-                combined = torch.stack(attn_out, dim=1).mean(dim=1)  # [B,heads,HW,d]
-                combined = combined.transpose(-2, -1).contiguous().view(B, C, Hs, Ws)
-            else:
-                combined = q_s
-
-            if s > 1:
-                combined = F.interpolate(combined, size=(H, W), mode='nearest')
-                combined = self.post_upsample_refine(combined)
-
-            collected.append(combined)
-
-        k = len(collected)
-        if k == 1:
-            out = collected[0]
-        elif k == 2:
-            w = F.softmax(self.fw2, dim=0)
-            out = self.fuse2(torch.cat([collected[0] * w[0], collected[1] * w[1]], dim=1))
-        elif k == 3:
-            w = F.softmax(self.fw3, dim=0)
-            out = self.fuse3(torch.cat([collected[i] * w[i] for i in range(3)], dim=1))
-        else:
-            w = F.softmax(self.fw4, dim=0)
-            out = self.fuse4(torch.cat([collected[i] * w[i] for i in range(4)], dim=1))
-
+        
+        # Generate reference points
+        ref_y, ref_x = torch.meshgrid(
+            torch.linspace(0, 1, H, device=query.device),
+            torch.linspace(0, 1, W, device=query.device),
+            indexing='ij'
+        )
+        ref_points = torch.stack([ref_x, ref_y], dim=-1).view(1, H*W, 2)
+        
+        # Predict sampling offsets
+        offsets = self.sampling_offsets(q_low)
+        offsets = offsets.view(B, self.num_heads, self.num_levels, self.num_points, 2, H, W)
+        offsets = offsets.permute(0, 5, 6, 1, 2, 3, 4).reshape(B, H*W, self.num_heads, self.num_levels, self.num_points, 2)
+        
+        # Normalize offsets
+        offsets = offsets / torch.tensor([W, H], device=query.device).view(1, 1, 1, 1, 1, 2)
+        
+        # Sampling locations
+        sampling_locs = ref_points.unsqueeze(2).unsqueeze(3).unsqueeze(4) + offsets
+        sampling_locs = sampling_locs.clamp(0, 1)
+        
+        # Attention weights
+        attn_weights = self.attention_weights(q_low)
+        attn_weights = attn_weights.view(B, self.num_heads, self.num_levels, self.num_points, H, W)
+        attn_weights = attn_weights.permute(0, 4, 5, 1, 2, 3).reshape(B, H*W, self.num_heads, self.num_levels * self.num_points)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.view(B, H*W, self.num_heads, self.num_levels, self.num_points)
+        
+        # Sample and aggregate
+        output = torch.zeros(B, C, H, W, device=query.device)
+        
+        for lvl in range(N):
+            v_lvl = self.value_proj(values[:, lvl] + self.level_embed[lvl].view(1, -1, 1, 1))
+            
+            for head in range(self.num_heads):
+                head_dim_start = head * self.head_dim
+                head_dim_end = (head + 1) * self.head_dim
+                v_head = v_lvl[:, head_dim_start:head_dim_end]
+                
+                for pt in range(self.num_points):
+                    # Get sampling grid for this point
+                    locs = sampling_locs[:, :, head, lvl, pt, :] * 2.0 - 1.0
+                    locs = locs.view(B, H, W, 2)
+                    
+                    # Sample values
+                    sampled = F.grid_sample(v_head, locs, mode='bilinear', align_corners=False)
+                    
+                    # Apply attention weight
+                    weight = attn_weights[:, :, head, lvl, pt].view(B, 1, H, W)
+                    output[:, head_dim_start:head_dim_end] += sampled * weight
+        
+        # Output projection
+        output = self.output_proj(output)
+        
+        # Add high-frequency
         scale = hf_res_scale if hf_res_scale is not None else self.hf_scale
-        out = out + q_high * scale
-        return out
+        output = output + q_high * scale
+        
+        return output
 
 
 # -------------------------
@@ -344,34 +569,51 @@ class ChannelAttention(nn.Module):
 # -------------------------
 
 class FlowWarping(nn.Module):
-    """Backward warping: sample img at grid + flow."""
-    def forward(self, img, flow):
-        B, C, H, W = img.size()
-        xx = torch.arange(0, W, device=img.device).view(1, 1, 1, W).repeat(B, 1, H, 1)
-        yy = torch.arange(0, H, device=img.device).view(1, 1, H, 1).repeat(B, 1, 1, W)
-        grid = torch.cat((xx, yy), 1).float()  # [B,2,H,W]
-
-        vgrid = grid + flow
-        vgrid[:, 0] = 2.0 * vgrid[:, 0] / max(W - 1, 1) - 1.0
-        vgrid[:, 1] = 2.0 * vgrid[:, 1] / max(H - 1, 1) - 1.0
-        vgrid = vgrid.permute(0, 2, 3, 1)
-        return F.grid_sample(img, vgrid, align_corners=True)
-
-
-class TemporalWeightingMLP(nn.Module):
-    """Turns per-anchor time scalars into a softmax over anchors."""
-    def __init__(self, num_anchors=3, hidden_dim=128):
+    """Backward warping with grid caching and improved normalization."""
+    
+    def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(num_anchors, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, num_anchors),
-            nn.Softmax(dim=1)
+        self.backwarp_tenGrid = {}
+    
+    def forward(self, img, flow):
+        """
+        Warp img using flow.
+        img: [B, C, H, W]
+        flow: [B, 2, H, W] with flow[:, 0] = x-displacement, flow[:, 1] = y-displacement
+        """
+        device = flow.device
+        B, _, H, W = flow.shape
+        
+        # Cache key based on device and size
+        k = (str(device), str(flow.size()))
+        
+        # Create or retrieve cached grid
+        if k not in self.backwarp_tenGrid:
+            tenHorizontal = torch.linspace(-1.0, 1.0, W, device=device).view(
+                1, 1, 1, W).expand(B, -1, H, -1)
+            tenVertical = torch.linspace(-1.0, 1.0, H, device=device).view(
+                1, 1, H, 1).expand(B, -1, -1, W)
+            self.backwarp_tenGrid[k] = torch.cat([tenHorizontal, tenVertical], 1)
+        
+        # Normalize flow based on image dimensions
+        tenFlow = torch.cat([
+            flow[:, 0:1, :, :] / ((img.shape[3] - 1.0) / 2.0),
+            flow[:, 1:2, :, :] / ((img.shape[2] - 1.0) / 2.0)
+        ], 1)
+        
+        # Add normalized flow to grid
+        g = (self.backwarp_tenGrid[k] + tenFlow).permute(0, 2, 3, 1)
+        
+        # Use appropriate padding mode based on device
+        padding_mode = 'zeros' if device.type == 'mps' else 'border'
+        
+        return F.grid_sample(
+            input=img, 
+            grid=g, 
+            mode='bilinear', 
+            padding_mode=padding_mode, 
+            align_corners=False
         )
-    def forward(self, timesteps):
-        return self.net(timesteps)
 
 
 # -------------------------
@@ -452,7 +694,7 @@ class DetailFuse(nn.Module):
     Wrapper to make frequency-aware attention plug into nn.Sequential cleanly.
     """
     def __init__(self, channels):
-        super().__init__
+        super().__init__()
         self.pre = DetailAwareResBlock(channels, norm='gn', preserve_details=True)
         self.freq = AdaptiveFrequencyDecoupling(channels)
         self.dpa = DetailPreservingAttention(channels)
@@ -471,11 +713,13 @@ class AnchorFusionNet(nn.Module):
     """
     Multi-anchor fusion with frequency-aware encoding, pyramid cross-attention,
     learned upsampling, and noise-preserving output paths.
+    Enhanced with temporal guidance for proper interpolation.
     """
-    def __init__(self, num_anchors=3, base_channels=64, max_attention_size=96*96):
+    def __init__(self, num_anchors=3, base_channels=64, max_attention_size=96*96, use_temporal_guidance=True):
         super().__init__()
         self.num_anchors = num_anchors
         self.base_channels = base_channels
+        self.use_temporal_guidance = use_temporal_guidance
 
         self.residual_scale = nn.Parameter(torch.tensor(0.1))
         self.detail_weight = nn.Parameter(torch.tensor(0.3))
@@ -487,8 +731,18 @@ class AnchorFusionNet(nn.Module):
         self.spectral_soft = True
 
         self.flow_warp = FlowWarping()
-        self.temporal_weighter = TemporalWeightingMLP(num_anchors)
+        
+        # Temporal modules - enhanced version if use_temporal_guidance is True
+        self.temporal_weighter = TemporalWeightingMLP(num_anchors, use_position_guidance=use_temporal_guidance)
         self.temporal_temperature = nn.Parameter(torch.tensor(1.0))
+        
+        # Additional temporal guidance modules when enabled
+        if use_temporal_guidance:
+            self.temporal_guidance = TemporalGuidanceModule(base_channels * 2)
+            self.temporal_flow_mod = TemporalFlowModulation(base_channels)
+        else:
+            self.temporal_guidance = None
+            self.temporal_flow_mod = None
 
         # Encoder
         self.encoder = nn.ModuleDict({
@@ -660,11 +914,15 @@ class AnchorFusionNet(nn.Module):
         I0_all, I1_all: [B,N,3,H,W] in [0,1]
         flows_all: [B,N,4,H,W] with [t->0_x, t->0_y, t->1_x, t->1_y]
         masks_all: [B,N,H,W] or [B,N,1,H,W] in [0,1]
-        timesteps: [B,N] real-valued features
+        timesteps: [B,N] temporal positions between 0 (at I0) and 1 (at I1)
         """
         B, N, _, H, W = I0_all.shape
+        
+        # Apply temporal flow modulation if enabled
+        if self.use_temporal_guidance and self.temporal_flow_mod is not None:
+            flows_all = self.temporal_flow_mod(flows_all, timesteps)
 
-        # temporal weights
+        # Get temporal weights (enhanced if using temporal guidance)
         t_weights = self.temporal_weighter(timesteps * self.temporal_temperature)
 
         warped_imgs = []
@@ -697,10 +955,9 @@ class AnchorFusionNet(nn.Module):
             mid = self.encoder['mid'](low)
             high = self.encoder['high'](mid)
 
-            w = t_weights[:, i:i+1, None, None]
-            feats_low.append(low * w)
-            feats_mid.append(mid * w)
-            feats_high.append(high * w)
+            feats_low.append(low)
+            feats_mid.append(mid)
+            feats_high.append(high)
 
             warped_imgs.append(warped)
             refined_masks.append(m)
@@ -709,23 +966,33 @@ class AnchorFusionNet(nn.Module):
         low_features = torch.stack(feats_low, dim=1)   # [B,N,C,H/2,W/2]
         mid_features = torch.stack(feats_mid, dim=1)   # [B,N,2C,H/4,W/4]
         high_features = torch.stack(feats_high, dim=1) # [B,N,4C,H/8,W/8]
+        
+        # Apply temporal guidance to features if enabled
+        if self.use_temporal_guidance and self.temporal_guidance is not None:
+            low_features = self.temporal_guidance(low_features, timesteps)
+        
+        # Apply temporal weights to features
+        w_exp = t_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        low_features_weighted = low_features * w_exp
+        mid_features_weighted = mid_features * w_exp
+        high_features_weighted = high_features * w_exp
 
-        # cross-anchor attention
-        query_high = high_features.mean(dim=1)
-        fused_high = self.cross_high(query_high, high_features, high_features, hf_res_scale=self.detail_weight)
+        # cross-anchor attention (using weighted features)
+        query_high = high_features_weighted.sum(dim=1) if self.use_temporal_guidance else high_features_weighted.mean(dim=1)
+        fused_high = self.cross_high(query_high, high_features_weighted, high_features_weighted, hf_res_scale=self.detail_weight)
 
         up_high = self.decoder['up_high_to_mid'][0](fused_high, target_size=mid_features.shape[-2:])
         up_high = self.decoder['up_high_to_mid'][1](up_high)
 
-        query_mid = mid_features.mean(dim=1)
-        fused_mid = self.cross_mid(query_mid, mid_features, mid_features, hf_res_scale=self.detail_weight)
+        query_mid = mid_features_weighted.sum(dim=1) if self.use_temporal_guidance else mid_features_weighted.mean(dim=1)
+        fused_mid = self.cross_mid(query_mid, mid_features_weighted, mid_features_weighted, hf_res_scale=self.detail_weight)
         fused_mid = nn.Sequential(*self.decoder['fuse_mid'])(torch.cat([up_high, fused_mid], dim=1))
 
         up_mid = self.decoder['up_mid_to_low'][0](fused_mid, target_size=low_features.shape[-2:])
         up_mid = self.decoder['up_mid_to_low'][1](up_mid)
 
-        query_low = low_features.mean(dim=1)
-        fused_low = self.cross_low(query_low, low_features, low_features, hf_res_scale=self.detail_weight)
+        query_low = low_features_weighted.sum(dim=1) if self.use_temporal_guidance else low_features_weighted.mean(dim=1)
+        fused_low = self.cross_low(query_low, low_features_weighted, low_features_weighted, hf_res_scale=self.detail_weight)
         fused_low = nn.Sequential(*self.decoder['fuse_low'])(torch.cat([up_mid, fused_low], dim=1))
 
         # to full resolution
@@ -761,15 +1028,15 @@ class AnchorFusionNet(nn.Module):
         if not skip_noise_inject:
             noise_add, noise_gate = self.noise_inject(decoded, warped_avg)
         else:
-            noise_add = torch.zeros_like(synthesized)  # Ensure same size as synthesized
-            noise_gate = torch.zeros_like(synthesized)  # Same for noise_gate
+            noise_add = torch.zeros_like(synthesized)
+            noise_gate = torch.zeros_like(synthesized[:, :1])
 
         # Optional content skip
         if not skip_content_skip:
             prior_mix, content_gate = self.content_skip(decoded, warped_avg)
         else:
-            prior_mix = torch.zeros_like(synthesized)  # Ensure same size as synthesized
-            content_gate = torch.zeros_like(synthesized)  # Same for noise_gate
+            prior_mix = torch.zeros_like(synthesized)
+            content_gate = torch.zeros_like(synthesized[:, :1])
 
         # Final output
         out = synthesized + residual + noise_add
@@ -807,11 +1074,12 @@ class AnchorFusionNet(nn.Module):
 # Factory
 # -------------------------
 
-def build_fusion_net(num_anchors=3, base_channels=64, max_attention_size=96*96):
+def build_fusion_net(num_anchors=3, base_channels=64, max_attention_size=96*96, use_temporal_guidance=True):
     return AnchorFusionNet(
         num_anchors=num_anchors,
         base_channels=base_channels,
-        max_attention_size=max_attention_size
+        max_attention_size=max_attention_size,
+        use_temporal_guidance=use_temporal_guidance
     )
 
 
@@ -827,8 +1095,69 @@ create_fusion_model = build_fusion_net
 
 
 # -------------------------
-# Smoke test
+# Smoke test and gradient check
 # -------------------------
+
+def check_gradients(model, verbose=True):
+    """
+    Check gradient flow through the model.
+    Returns dict with gradient statistics for each parameter.
+    """
+    grad_stats = {}
+    zero_grad_params = []
+    nan_grad_params = []
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.data.norm(2).item()
+            grad_mean = param.grad.data.mean().item()
+            grad_std = param.grad.data.std().item()
+            
+            grad_stats[name] = {
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'shape': tuple(param.grad.shape)
+            }
+            
+            if grad_norm == 0:
+                zero_grad_params.append(name)
+            if torch.isnan(param.grad).any():
+                nan_grad_params.append(name)
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("GRADIENT CHECK RESULTS")
+        print("="*60)
+        
+        if zero_grad_params:
+            print(f"\n⚠️  WARNING: {len(zero_grad_params)} parameters have zero gradients:")
+            for p in zero_grad_params[:5]:  # Show first 5
+                print(f"  - {p}")
+            if len(zero_grad_params) > 5:
+                print(f"  ... and {len(zero_grad_params) - 5} more")
+        
+        if nan_grad_params:
+            print(f"\n❌ ERROR: {len(nan_grad_params)} parameters have NaN gradients:")
+            for p in nan_grad_params[:5]:
+                print(f"  - {p}")
+        
+        if not zero_grad_params and not nan_grad_params:
+            print("\n✅ All gradients are healthy!")
+        
+        # Show gradient statistics for key layers
+        print("\nGradient Statistics (key layers):")
+        key_patterns = ['encoder', 'decoder', 'cross_', 'temporal_', 'synthesis', 'residual_head']
+        for pattern in key_patterns:
+            matching = [k for k in grad_stats.keys() if pattern in k]
+            if matching:
+                # Show first match for each pattern
+                k = matching[0]
+                s = grad_stats[k]
+                print(f"  {k[:50]:50s} -> norm: {s['norm']:.6f}, mean: {s['mean']:.2e}")
+    
+    return grad_stats, zero_grad_params, nan_grad_params
+
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -838,21 +1167,94 @@ if __name__ == "__main__":
     print("-" * 60)
     print("device:", device)
 
-    model = build_fusion_net(num_anchors=3, base_channels=32).to(device)
+    # Test with temporal guidance enabled
+    model = build_fusion_net(num_anchors=3, base_channels=64, use_temporal_guidance=True).to(device)
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
 
-    B, N, H, W = 1, 3, 2048, 2048
-    I0_all = torch.randn(B, N, 3, H, W, device=device)
-    I1_all = torch.randn(B, N, 3, H, W, device=device)
-    flows_all = torch.randn(B, N, 4, H, W, device=device)
-    masks_all = torch.rand(B, N, H, W, device=device)
-    timesteps = torch.rand(B, N, device=device)
+    # Prepare test data
+    B, N, H, W = 1, 3, 512, 512
+    I0_all = torch.randn(B, N, 3, H, W, device=device, requires_grad=True)
+    I1_all = torch.randn(B, N, 3, H, W, device=device, requires_grad=True)
+    flows_all = torch.randn(B, N, 4, H, W, device=device, requires_grad=True)
+    masks_all = torch.rand(B, N, H, W, device=device, requires_grad=True)
+    timesteps = torch.rand(B, N, device=device, requires_grad=True)
+    
+    # Create target for loss computation
+    target = torch.rand(B, 3, H, W, device=device)
 
-    with torch.no_grad():
+    print("\n" + "="*60)
+    print("FORWARD PASS TEST")
+    print("="*60)
+    
+    # Test forward pass
+    try:
         out, aux = model(I0_all, I1_all, flows_all, masks_all, timesteps)
+        print(f"Forward pass successful!")
+        print(f"Output shape: {tuple(out.shape)}")
+        print(f"Output range: [{out.min().item():.3f}, {out.max().item():.3f}]")
+        print(f"Temporal weights: {aux['temporal_weights'][0].detach().cpu().tolist()}")
+    except Exception as e:
+        print(f"Forward pass failed: {e}")
+        raise
 
-    print(f"Output shape: {tuple(out.shape)}")
-    print(f"Residual scale: {aux['residual_scale']:.3f}")
-    print(f"Detail weight: {aux['detail_weight']:.3f}")
-    print(f"Spectral alpha: {aux['spectral_alpha']:.3f}")
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total trainable parameters: {total_params:,}")
+    print("\n" + "="*60)
+    print("BACKWARD PASS TEST")
+    print("="*60)
+    
+    # Test backward pass with different loss functions
+    loss_functions = [
+        ("L1", nn.L1Loss()),
+        ("L2", nn.MSELoss()),
+        ("Perceptual (simulated)", lambda x, y: ((x - y) ** 2).mean() + 0.1 * torch.abs(x - y).mean())
+    ]
+    
+    for loss_name, loss_fn in loss_functions:
+        print(f"\nTesting with {loss_name} loss:")
+        
+        # Reset gradients
+        model.zero_grad()
+        for param in [I0_all, I1_all, flows_all, masks_all, timesteps]:
+            if param.grad is not None:
+                param.grad.zero_()
+        
+        # Forward pass
+        out, aux = model(I0_all, I1_all, flows_all, masks_all, timesteps)
+        
+        # Compute loss
+        if callable(loss_fn):
+            loss = loss_fn(out, target)
+        else:
+            loss = loss_fn(out, target)
+        
+        print(f"  Loss value: {loss.item():.6f}")
+        
+        # Backward pass
+        try:
+            loss.backward()
+            print(f"Backward pass successful!")
+            
+            # Check gradients
+            grad_stats, zero_grads, nan_grads = check_gradients(model, verbose=(loss_name == "L1"))
+            
+            # Check input gradients
+            print(f"\n  Input gradients:")
+            for name, tensor in [("I0", I0_all), ("I1", I1_all), ("flows", flows_all), 
+                                ("masks", masks_all), ("timesteps", timesteps)]:
+                if tensor.grad is not None:
+                    grad_norm = tensor.grad.norm().item()
+                    print(f"    {name:10s} grad norm: {grad_norm:.6f}")
+                else:
+                    print(f"    {name:10s} grad: None")
+            
+        except Exception as e:
+            print(f"Backward pass failed: {e}")
+            raise
+    
+    print("\n" + "="*60)
+    print("TEST COMPLETE")
+    print("="*60)

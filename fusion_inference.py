@@ -72,8 +72,7 @@ class FusionInference:
     
     def __init__(self, model_path, rife_model_dir='ckpt/rifev4_25', 
                  num_anchors=3, base_channels=64, max_attention_size=96*96,
-                 device=None, scale=1.0, UHD=False, cache_flows=True,
-                 skip_noise_inject=False, skip_content_skip=False):
+                 device=None, scale=1.0, UHD=False, cache_flows=True):
         """
         Initialize the inference engine
         
@@ -92,10 +91,6 @@ class FusionInference:
         self.UHD = UHD
         self.cache_flows = cache_flows
         self.flow_cache = {} if cache_flows else None
-
-        # Set skip flags
-        self.skip_noise_inject = skip_noise_inject
-        self.skip_content_skip = skip_content_skip
         
         # Auto-adjust scale for UHD
         if self.UHD and self.scale == 1.0:
@@ -420,9 +415,7 @@ class FusionInference:
         
         # Run fusion model
         with torch.no_grad():
-            output, _ = self.fusion_model(I0_all, I1_all, flows_all, masks_all, timesteps,
-                                          skip_noise_inject=self.skip_noise_inject,
-                                          skip_content_skip=self.skip_content_skip)
+            output, _ = self.fusion_model(I0_all, I1_all, flows_all, masks_all, timesteps)
         
         # Remove padding if necessary
         if self.padding[1] + self.padding[3] > 0:
@@ -598,12 +591,6 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug mode to check image values')
     
-        # Flags to skip NoiseInject or ContentSkip
-    parser.add_argument('--skip_noise_inject', action='store_true', 
-                        help='Skip NoiseInject module during inference')
-    parser.add_argument('--skip_content_skip', action='store_true', 
-                        help='Skip ContentSkip module during inference')
-    
     args = parser.parse_args()
     
     # Setup device
@@ -623,8 +610,6 @@ def main():
         scale=args.scale,
         UHD=args.UHD,
         cache_flows=not args.no_cache,
-        skip_noise_inject=args.skip_noise_inject,
-        skip_content_skip=args.skip_content_skip
     )
     
     # Process directory

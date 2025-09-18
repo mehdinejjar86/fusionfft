@@ -14,6 +14,7 @@ from datetime import datetime
 import warnings
 from skimage.metrics import peak_signal_noise_ratio as psnr_func
 from skimage.metrics import structural_similarity as ssim_func
+from torch.amp import autocast, GradScaler
 
 # Weights & Biases support
 try:
@@ -480,6 +481,7 @@ class AnchorFusionTrainer:
     def __init__(self, config):
         self.config = config
         self.device = self._setup_device()
+        self._setup_mixed_precision()
 
         # Run dirs
         self.run_timestamp = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
@@ -573,6 +575,66 @@ class AnchorFusionTrainer:
             device = torch.device("cpu")
             print("Using CPU")
         return device
+    
+    def _setup_mixed_precision(self):
+        """Setup mixed precision training based on config."""
+        self.precision = getattr(self.config, 'precision', 'fp32')
+        self.use_amp = False
+        self.scaler = None
+        self.amp_dtype = None
+        
+        # Always set autocast_device based on device type (needed for autocast API)
+        if self.device.type in ['cuda', 'cpu', 'mps']:
+            self.autocast_device = self.device.type
+        else:
+            self.autocast_device = 'cpu'  # fallback
+        
+        if self.precision != 'fp32':
+            if self.device.type == 'cuda':
+                # CUDA supports both fp16 and bf16
+                if self.precision == 'bf16':
+                    if torch.cuda.is_bf16_supported():
+                        self.use_amp = True
+                        self.amp_dtype = torch.bfloat16
+                    else:
+                        print(f"Warning: BF16 not supported on this GPU. Falling back to FP32.")
+                        self.precision = 'fp32'
+                elif self.precision == 'fp16':
+                    self.use_amp = True
+                    self.amp_dtype = torch.float16
+                    # Only fp16 needs GradScaler
+                    self.scaler = GradScaler('cuda')
+                        
+            elif self.device.type == 'cpu':
+                # CPU only supports bf16
+                if self.precision == 'bf16':
+                    self.use_amp = True
+                    self.amp_dtype = torch.bfloat16
+                else:
+                    print(f"Warning: CPU only supports BF16 mixed precision. Falling back to FP32.")
+                    self.precision = 'fp32'
+                        
+            elif self.device.type == 'mps':
+                # MPS doesn't support autocast yet
+                print(f"Warning: MPS doesn't support mixed precision training yet. Using FP32.")
+                self.precision = 'fp32'
+                # Note: You could still manually cast model to fp16 on MPS, but without autocast
+                # it's more complex and may not provide benefits
+            else:
+                print(f"Warning: Device {self.device.type} doesn't support mixed precision. Using FP32.")
+                self.precision = 'fp32'
+        
+        # Set default dtype for fp32 mode
+        if not self.use_amp:
+            self.amp_dtype = torch.float32
+        
+        print(f"Training precision: {self.precision.upper()}")
+        if self.use_amp:
+            print(f"  Device: {self.autocast_device}")
+            print(f"  AMP dtype: {self.amp_dtype}")
+            print(f"  GradScaler: {'enabled' if self.scaler else 'not needed'}")
+        else:
+            print(f"  Device: {self.autocast_device} (autocast disabled)")
 
     def setup_directories(self):
         self.checkpoint_dir = Path(self.config.checkpoint_dir)
@@ -787,33 +849,59 @@ class AnchorFusionTrainer:
             timesteps = batch['timesteps'].to(self.device, non_blocking=True)
             I_gt = batch['I_gt'].to(self.device, non_blocking=True)
 
-            output, aux = self.model(I0_all, I1_all, flows_all, masks_all, timesteps)
-            if output.device != I_gt.device:
-                output = output.to(I_gt.device)
-
-            losses = self.loss_fn(output, I_gt, aux)
-            total_loss = losses['total']
+            # Forward pass with optional mixed precision
+            with autocast(device_type=self.autocast_device, dtype=self.amp_dtype, enabled=self.use_amp):
+                output, aux = self.model(I0_all, I1_all, flows_all, masks_all, timesteps)
+                if output.device != I_gt.device:
+                    output = output.to(I_gt.device)
+                
+                losses = self.loss_fn(output, I_gt, aux)
+                total_loss = losses['total']
 
             self.optimizer.zero_grad()
-            total_loss.backward()
-
-            if hasattr(self.model, 'sync_gradients'):
-                self.model.sync_gradients()
-
-            if self.config.grad_clip > 0:
-                if hasattr(self.model, 'models'):
-                    nn.utils.clip_grad_norm_(self.model.models[0].parameters(), self.config.grad_clip)
-                else:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-
-            self.optimizer.step()
+            
+            # Backward pass - handle gradient scaling for fp16
+            if self.scaler is not None:
+                # FP16 path with gradient scaling
+                self.scaler.scale(total_loss).backward()
+                
+                if hasattr(self.model, 'sync_gradients'):
+                    self.model.sync_gradients()
+                
+                if self.config.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    if hasattr(self.model, 'models'):
+                        nn.utils.clip_grad_norm_(self.model.models[0].parameters(), self.config.grad_clip)
+                    else:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # FP32 or BF16 path (no gradient scaling needed)
+                total_loss.backward()
+                
+                if hasattr(self.model, 'sync_gradients'):
+                    self.model.sync_gradients()
+                
+                if self.config.grad_clip > 0:
+                    if hasattr(self.model, 'models'):
+                        nn.utils.clip_grad_norm_(self.model.models[0].parameters(), self.config.grad_clip)
+                    else:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                
+                self.optimizer.step()
 
             if hasattr(self.model, 'sync_parameters'):
                 self.model.sync_parameters()
 
+            # Metrics calculation (always in fp32 for accuracy)
             with torch.no_grad():
-                output_resized = self.metrics_calc.resize_for_metrics(output)
-                I_gt_resized = self.metrics_calc.resize_for_metrics(I_gt)
+                output_fp32 = output.float() if output.dtype != torch.float32 else output
+                I_gt_fp32 = I_gt.float() if I_gt.dtype != torch.float32 else I_gt
+                
+                output_resized = self.metrics_calc.resize_for_metrics(output_fp32)
+                I_gt_resized = self.metrics_calc.resize_for_metrics(I_gt_fp32)
                 batch_psnr = self.metrics_calc.calculate_psnr(output_resized, I_gt_resized)
                 batch_ssim = self.metrics_calc.calculate_ssim(output_resized, I_gt_resized)
                 epoch_psnr += batch_psnr
@@ -831,7 +919,8 @@ class AnchorFusionTrainer:
                 'edge': f"{losses.get('edge', 0):.4f}",
                 'psnr': f"{batch_psnr:.2f}",
                 'ssim': f"{batch_ssim:.4f}",
-                'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}"
+                'lr': f"{self.optimizer.param_groups[0]['lr']:.6f}",
+                'prec': self.precision
             })
 
             if self.use_wandb and batch_idx % 10 == 0:
@@ -873,14 +962,20 @@ class AnchorFusionTrainer:
                 timesteps = batch['timesteps'].to(self.device, non_blocking=True)
                 I_gt = batch['I_gt'].to(self.device, non_blocking=True)
 
-                output, aux = self.model(I0_all, I1_all, flows_all, masks_all, timesteps)
-                if output.device != I_gt.device:
-                    output = output.to(I_gt.device)
+                # Use mixed precision for validation too
+                with autocast(device_type=self.autocast_device, dtype=self.amp_dtype, enabled=self.use_amp):
+                    output, aux = self.model(I0_all, I1_all, flows_all, masks_all, timesteps)
+                    if output.device != I_gt.device:
+                        output = output.to(I_gt.device)
+                    
+                    losses = self.loss_fn(output, I_gt, aux)
 
-                losses = self.loss_fn(output, I_gt, aux)
-
-                output_resized = self.metrics_calc.resize_for_metrics(output)
-                I_gt_resized = self.metrics_calc.resize_for_metrics(I_gt)
+                # Convert to fp32 for metrics
+                output_fp32 = output.float() if output.dtype != torch.float32 else output
+                I_gt_fp32 = I_gt.float() if I_gt.dtype != torch.float32 else I_gt
+                
+                output_resized = self.metrics_calc.resize_for_metrics(output_fp32)
+                I_gt_resized = self.metrics_calc.resize_for_metrics(I_gt_fp32)
                 batch_psnr = self.metrics_calc.calculate_psnr(output_resized, I_gt_resized)
                 batch_ssim = self.metrics_calc.calculate_ssim(output_resized, I_gt_resized)
                 val_psnr += batch_psnr
@@ -900,6 +995,7 @@ class AnchorFusionTrainer:
         val_losses['psnr'] = val_psnr
         val_losses['ssim'] = val_ssim
         return val_losses
+
 
     def save_sample_images(self, epoch, num_samples=4):
         self.model.eval()
@@ -971,12 +1067,14 @@ class AnchorFusionTrainer:
             'model_state_dict': model_state,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,  # Add scaler state
             'best_psnr': self.best_psnr,
             'best_ssim': self.best_ssim,
             'best_val_psnr': self.best_val_psnr,
             'best_val_ssim': self.best_val_ssim,
             'epoch_metrics': self.epoch_metrics,
             'config': vars(self.config),
+            'precision': self.precision,  # Save precision setting
             'wandb_run_id': wandb.run.id if self.use_wandb else None
         }
 
@@ -1021,6 +1119,10 @@ class AnchorFusionTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if self.scheduler and checkpoint.get('scheduler_state_dict'):
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Restore scaler state if using fp16
+        if self.scaler and checkpoint.get('scaler_state_dict'):
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_psnr = checkpoint.get('best_psnr', 0)
@@ -1032,6 +1134,9 @@ class AnchorFusionTrainer:
         print(f"Checkpoint loaded from {checkpoint_path}")
         print(f"Resuming from epoch {self.start_epoch}")
         print(f"Best train PSNR: {self.best_psnr:.2f} dB, Best val PSNR: {self.best_val_psnr:.2f} dB")
+        if 'precision' in checkpoint:
+            print(f"Model was trained with precision: {checkpoint['precision']}")
+
 
     def train(self):
         print(f"\nStarting training for {self.config.epochs} epochs")
@@ -1183,6 +1288,10 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--mix_strategy', type=str, default='uniform')
     parser.add_argument('--cache_flows', action='store_true')
+
+    parser.add_argument('--precision', type=str, default='fp32', 
+                    choices=['fp32', 'fp16', 'bf16'],
+                    help='Training precision: fp32 (default), fp16, or bf16')
 
     args = parser.parse_args()
 

@@ -15,6 +15,7 @@ import warnings
 from skimage.metrics import peak_signal_noise_ratio as psnr_func
 from skimage.metrics import structural_similarity as ssim_func
 from torch.amp import autocast, GradScaler
+from torch.amp.autocast_mode import is_autocast_available
 
 # Weights & Biases support
 try:
@@ -577,64 +578,105 @@ class AnchorFusionTrainer:
         return device
     
     def _setup_mixed_precision(self):
-        """Setup mixed precision training based on config."""
+        """Setup mixed precision training based on config and device capabilities."""
         self.precision = getattr(self.config, 'precision', 'fp32')
         self.use_amp = False
         self.scaler = None
-        self.amp_dtype = None
+        self.amp_dtype = torch.float32  # default
         
-        # Always set autocast_device based on device type (needed for autocast API)
-        if self.device.type in ['cuda', 'cpu', 'mps']:
-            self.autocast_device = self.device.type
-        else:
-            self.autocast_device = 'cpu'  # fallback
+        # Always set autocast_device based on device type
+        self.autocast_device = self.device.type if self.device.type in ['cuda', 'cpu', 'mps'] else 'cpu'
+        
+        # Check if autocast is available for this device
+        autocast_available = is_autocast_available(self.autocast_device)
         
         if self.precision != 'fp32':
-            if self.device.type == 'cuda':
-                # CUDA supports both fp16 and bf16
-                if self.precision == 'bf16':
-                    if torch.cuda.is_bf16_supported():
+            if not autocast_available:
+                print(f"Warning: Autocast not available for {self.device.type}. Falling back to FP32.")
+                self.precision = 'fp32'
+            else:
+                if self.device.type == 'cuda':
+                    # CUDA supports both fp16 and bf16
+                    if self.precision == 'bf16':
+                        if torch.cuda.is_bf16_supported():
+                            self.use_amp = True
+                            self.amp_dtype = torch.bfloat16
+                        else:
+                            print(f"Warning: BF16 not supported on this GPU. Falling back to FP32.")
+                            self.precision = 'fp32'
+                    elif self.precision == 'fp16':
+                        self.use_amp = True
+                        self.amp_dtype = torch.float16
+                        # Only fp16 on CUDA needs GradScaler
+                        self.scaler = GradScaler('cuda')
+                            
+                elif self.device.type == 'cpu':
+                    # CPU typically supports bf16, sometimes fp16
+                    if self.precision == 'bf16':
                         self.use_amp = True
                         self.amp_dtype = torch.bfloat16
-                    else:
-                        print(f"Warning: BF16 not supported on this GPU. Falling back to FP32.")
-                        self.precision = 'fp32'
-                elif self.precision == 'fp16':
-                    self.use_amp = True
-                    self.amp_dtype = torch.float16
-                    # Only fp16 needs GradScaler
-                    self.scaler = GradScaler('cuda')
-                        
-            elif self.device.type == 'cpu':
-                # CPU only supports bf16
-                if self.precision == 'bf16':
-                    self.use_amp = True
-                    self.amp_dtype = torch.bfloat16
+                    elif self.precision == 'fp16':
+                        # Try fp16 on CPU (might not be supported)
+                        try:
+                            # Test if fp16 works
+                            with autocast(device_type='cpu', dtype=torch.float16, enabled=True):
+                                test_tensor = torch.randn(2, 2)
+                            self.use_amp = True
+                            self.amp_dtype = torch.float16
+                            print("Note: FP16 on CPU may be slower than BF16 or FP32")
+                        except:
+                            print(f"Warning: FP16 not supported on CPU. Trying BF16...")
+                            self.precision = 'bf16'
+                            self.use_amp = True
+                            self.amp_dtype = torch.bfloat16
+                            
+                elif self.device.type == 'mps':
+                    # MPS (Apple Silicon) - test what's available
+                    if self.precision == 'bf16':
+                        try:
+                            # Test if bf16 works on MPS
+                            with autocast(device_type='mps', dtype=torch.bfloat16, enabled=True):
+                                test_tensor = torch.randn(2, 2, device='mps')
+                            self.use_amp = True
+                            self.amp_dtype = torch.bfloat16
+                            print("MPS BF16 support detected and enabled")
+                        except Exception as e:
+                            print(f"Warning: BF16 not supported on MPS: {e}. Falling back to FP32.")
+                            self.precision = 'fp32'
+                    elif self.precision == 'fp16':
+                        try:
+                            # Test if fp16 works on MPS
+                            with autocast(device_type='mps', dtype=torch.float16, enabled=True):
+                                test_tensor = torch.randn(2, 2, device='mps')
+                            self.use_amp = True
+                            self.amp_dtype = torch.float16
+                            print("MPS FP16 support detected and enabled")
+                            # Note: MPS doesn't use GradScaler
+                        except Exception as e:
+                            print(f"Warning: FP16 not supported on MPS: {e}. Falling back to FP32.")
+                            self.precision = 'fp32'
                 else:
-                    print(f"Warning: CPU only supports BF16 mixed precision. Falling back to FP32.")
+                    print(f"Warning: Unknown device {self.device.type}. Using FP32.")
                     self.precision = 'fp32'
-                        
-            elif self.device.type == 'mps':
-                # MPS doesn't support autocast yet
-                print(f"Warning: MPS doesn't support mixed precision training yet. Using FP32.")
-                self.precision = 'fp32'
-                # Note: You could still manually cast model to fp16 on MPS, but without autocast
-                # it's more complex and may not provide benefits
-            else:
-                print(f"Warning: Device {self.device.type} doesn't support mixed precision. Using FP32.")
-                self.precision = 'fp32'
         
-        # Set default dtype for fp32 mode
-        if not self.use_amp:
-            self.amp_dtype = torch.float32
-        
-        print(f"Training precision: {self.precision.upper()}")
+        # Print final configuration
+        print(f"\nMixed Precision Configuration:")
+        print(f"  Device: {self.device.type}")
+        print(f"  Autocast available: {autocast_available}")
+        print(f"  Training precision: {self.precision.upper()}")
         if self.use_amp:
-            print(f"  Device: {self.autocast_device}")
+            print(f"  AMP enabled: Yes")
             print(f"  AMP dtype: {self.amp_dtype}")
             print(f"  GradScaler: {'enabled' if self.scaler else 'not needed'}")
         else:
-            print(f"  Device: {self.autocast_device} (autocast disabled)")
+            print(f"  AMP enabled: No (using native FP32)")
+            
+        # Additional device-specific notes
+        if self.device.type == 'mps' and self.use_amp:
+            print("\nNote for MPS:")
+            print("  - Mixed precision on MPS is experimental")
+            print("  - Performance gains may vary")
+            print("  - If you encounter issues, use --precision fp32")
 
     def setup_directories(self):
         self.checkpoint_dir = Path(self.config.checkpoint_dir)

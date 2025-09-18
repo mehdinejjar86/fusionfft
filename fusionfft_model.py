@@ -1177,7 +1177,7 @@ if __name__ == "__main__":
     print(f"Trainable parameters: {trainable_params:,}")
 
     # Prepare test data
-    B, N, H, W = 1, 3, 512, 512
+    B, N, H, W = 1, 3, 2048, 2048
     I0_all = torch.randn(B, N, 3, H, W, device=device, requires_grad=True)
     I1_all = torch.randn(B, N, 3, H, W, device=device, requires_grad=True)
     flows_all = torch.randn(B, N, 4, H, W, device=device, requires_grad=True)
